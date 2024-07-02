@@ -24,9 +24,9 @@ load_dotenv()
 """
 We will load our environment variables here.
 """
-HF_LLM_ENDPOINT = os.environ["https://k7skg8bodgwnp2la.us-east-1.aws.endpoints.huggingface.cloud"]
-HF_EMBED_ENDPOINT = os.environ["https://bnq0ttndb7cdj52q.us-east-1.aws.endpoints.huggingface.cloud"]
-HF_TOKEN = os.environ["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"]
+HF_LLM_ENDPOINT = os.environ["HF_LLM_ENDPOINT"]
+HF_EMBED_ENDPOINT = os.environ["HF_EMBED_ENDPOINT"]
+HF_TOKEN = os.environ["HF_TOKEN"]
 
 # ---- GLOBAL DECLARATIONS ---- #
 
@@ -40,7 +40,7 @@ HF_TOKEN = os.environ["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"]
 ### 1. CREATE TEXT LOADER AND LOAD DOCUMENTS
 ### NOTE: PAY ATTENTION TO THE PATH THEY ARE IN. 
 text_loader = TextLoader("./data/paul_graham_essays.txt")
-documents = document_loader.load()
+documents = text_loader.load()
 
 ### 2. CREATE TEXT SPLITTER AND SPLIT DOCUMENTS
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=30)
@@ -53,21 +53,64 @@ hf_embeddings = HuggingFaceEndpointEmbeddings(
     huggingfacehub_api_token=HF_TOKEN,
 )
 
-if os.path.exists("./data/vectorstore"):
-    vectorstore = FAISS.load_local(
-        "./data/vectorstore", 
-        hf_embeddings, 
-        allow_dangerous_deserialization=True # this is necessary to load the vectorstore from disk as it's stored as a `.pkl` file.
-    )
-    hf_retriever = vectorstore.as_retriever()
-    print("Loaded Vectorstore")
-else:
-    print("Indexing Files")
-    os.makedirs("./data/vectorstore", exist_ok=True)
-    ### 4. INDEX FILES
-    ### NOTE: REMEMBER TO BATCH THE DOCUMENTS WITH MAXIMUM BATCH SIZE = 32
+def load_or_create_vectorstore():
+    vectorstore_dir = "./data/vectorstore"
+    
+    # Ensure the directory path is absolute
+    base_dir = os.path.abspath(os.path.dirname(__file__))
+    vectorstore_path = os.path.join(base_dir, vectorstore_dir)
 
-hf_retriever = vectorstore.as_retriever()
+    try:
+        if os.path.exists(vectorstore_path):
+            vectorstore = FAISS.load_local(
+                vectorstore_path, 
+                hf_embeddings, 
+                allow_dangerous_deserialization=True  # Necessary to load the vectorstore from disk as it's stored as a `.pkl` file.
+            )
+            global hf_retriever
+            hf_retriever = vectorstore.as_retriever()
+            print("Loaded Vectorstore")
+        else:
+            print("Indexing Files")
+            os.makedirs(vectorstore_path, exist_ok=True)
+            for i in range(0, len(split_documents), 32):
+                if i == 0:
+                    vectorstore = FAISS.from_documents(split_documents[i:i+32], hf_embeddings)
+                else:
+                    vectorstore.add_documents(split_documents[i:i+32])
+            vectorstore.save_local(vectorstore_path)
+            hf_retriever = vectorstore.as_retriever()
+            print(f"Vectorstore saved at {vectorstore_path}")
+    except PermissionError as e:
+        print(f"Permission denied: {e}")
+        # Handle the error or choose a different directory
+        # For example, use a directory in the user's home directory
+        home_dir = os.path.expanduser("~")
+        vectorstore_path = os.path.join(home_dir, "data/vectorstore")
+        try:
+            if os.path.exists(vectorstore_path):
+                vectorstore = FAISS.load_local(
+                    vectorstore_path, 
+                    hf_embeddings, 
+                    allow_dangerous_deserialization=True
+                )
+                hf_retriever = vectorstore.as_retriever()
+                print("Loaded Vectorstore from home directory")
+            else:
+                print("Indexing Files in home directory")
+                os.makedirs(vectorstore_path, exist_ok=True)
+                for i in range(0, len(split_documents), 32):
+                    if i == 0:
+                        vectorstore = FAISS.from_documents(split_documents[i:i+32], hf_embeddings)
+                    else:
+                        vectorstore.add_documents(split_documents[i:i+32])
+                vectorstore.save_local(vectorstore_path)
+                hf_retriever = vectorstore.as_retriever()
+                print(f"Vectorstore saved at {vectorstore_path}")
+        except Exception as e:
+            print(f"Failed to create or save vectorstore: {e}")
+
+load_or_create_vectorstore()
 
 # -- AUGMENTED -- #
 """
@@ -75,17 +118,39 @@ hf_retriever = vectorstore.as_retriever()
 2. Create a Prompt Template from the String Template
 """
 ### 1. DEFINE STRING TEMPLATE
-RAG_PROMPT_TEMPLATE = 
+RAG_PROMPT_TEMPLATE =  """"\
+<|start_header_id|>system<|end_header_id|>
+
+You are a helpful assistant. 
+You answer user questions based on provided context. 
+If you can't answer the question with the provided context, say you don't know.<|eot_id|>
+<|start_header_id|>user<|end_header_id|>
+User Query:
+{query}
+
+Context:
+{context}<|eot_id|>
+
+<|start_header_id|>assistant<|end_header_id|>
+"""
 
 ### 2. CREATE PROMPT TEMPLATE
-rag_prompt =
+rag_prompt = PromptTemplate.from_template(RAG_PROMPT_TEMPLATE)
 
 # -- GENERATION -- #
 """
 1. Create a HuggingFaceEndpoint for the LLM
 """
 ### 1. CREATE HUGGINGFACE ENDPOINT FOR LLM
-hf_llm = 
+hf_llm = hf_llm = HuggingFaceEndpoint(
+    endpoint_url=HF_LLM_ENDPOINT,
+    max_new_tokens=512,
+    top_k=10,
+    top_p=0.95,
+    temperature=0.3,
+    repetition_penalty=1.15,
+    huggingfacehub_api_token=HF_TOKEN,
+)
 
 @cl.author_rename
 def rename(original_author: str):
@@ -110,7 +175,10 @@ async def start_chat():
     """
 
     ### BUILD LCEL RAG CHAIN THAT ONLY RETURNS TEXT
-    lcel_rag_chain = 
+    lcel_rag_chain = (
+        {"context": itemgetter("query") | hf_retriever, "query": itemgetter("query")}
+        | rag_prompt | hf_llm
+    )
 
     cl.user_session.set("lcel_rag_chain", lcel_rag_chain)
 
